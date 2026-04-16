@@ -4,25 +4,27 @@ import pandas as pd
 
 st.set_page_config(page_title="Options Scanner")
 
-st.title("📊 Options Trading Scanner (Real Data)")
+st.title("📊 Options Trading Scanner (Spreads + Risk Control)")
 
 user_input = st.text_input("Enter up to 10 tickers (comma separated):")
 
 system_tickers = ["SPY", "QQQ", "IWM", "AAPL", "MSFT"]
 
-# ---------------- GET STOCK DATA ----------------
+MAX_RISK = 500  # your rule
+
+# ---------------- STOCK ----------------
 def get_stock(ticker):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1mo")
         if hist.empty:
-            return None, None
+            return None, None, None
         price = float(hist["Close"].iloc[-1])
-        return stock, price
+        return stock, hist, price
     except:
-        return None, None
+        return None, None, None
 
-# ---------------- MARKET TYPE ----------------
+# ---------------- MARKET ----------------
 def classify_market(hist):
     close = hist["Close"]
     ma20 = close.rolling(20).mean().iloc[-1]
@@ -35,68 +37,79 @@ def classify_market(hist):
     else:
         return "Bearish"
 
-# ---------------- OPTIONS STRATEGY ----------------
-def find_trade(stock, ticker, price, condition):
+# ---------------- SPREAD BUILDER ----------------
+def build_spread(stock, ticker, price, condition):
 
     try:
-        expirations = stock.options
-        if not expirations:
-            return None
+        expiry = stock.options[0]
+        chain = stock.option_chain(expiry)
 
-        expiry = expirations[0]  # nearest weekly
-        opt = stock.option_chain(expiry)
+        calls = chain.calls.sort_values("strike")
+        puts = chain.puts.sort_values("strike")
 
-        calls = opt.calls
-        puts = opt.puts
+        width = 5  # default spread width
 
         if condition == "Bullish":
-            # Sell OTM Put
             otm_puts = puts[puts["strike"] < price]
-            if otm_puts.empty:
+
+            if len(otm_puts) < 2:
                 return None
 
-            strike = otm_puts.iloc[-1]
-            credit = strike["lastPrice"]
+            sell = otm_puts.iloc[-1]
+            buy = otm_puts.iloc[-2]
+
+            credit = sell["lastPrice"] - buy["lastPrice"]
+            risk = (sell["strike"] - buy["strike"]) * 100 - credit * 100
+
+            if risk > MAX_RISK or credit <= 0:
+                return None
 
             return {
                 "Ticker": ticker,
-                "Strategy": "Bull Put (Sell Put)",
-                "Strike": strike["strike"],
+                "Strategy": "Bull Put Spread",
+                "Sell Strike": sell["strike"],
+                "Buy Strike": buy["strike"],
                 "Expiry": expiry,
-                "Credit": round(credit, 2),
-                "Prob (~)": "65-75%",
-                "Risk": "Defined"
+                "Credit ($)": round(credit * 100, 2),
+                "Max Risk ($)": round(risk, 2),
+                "Market": condition
             }
 
         elif condition == "Bearish":
-            # Sell OTM Call
             otm_calls = calls[calls["strike"] > price]
-            if otm_calls.empty:
+
+            if len(otm_calls) < 2:
                 return None
 
-            strike = otm_calls.iloc[0]
-            credit = strike["lastPrice"]
+            sell = otm_calls.iloc[0]
+            buy = otm_calls.iloc[1]
+
+            credit = sell["lastPrice"] - buy["lastPrice"]
+            risk = (buy["strike"] - sell["strike"]) * 100 - credit * 100
+
+            if risk > MAX_RISK or credit <= 0:
+                return None
 
             return {
                 "Ticker": ticker,
-                "Strategy": "Bear Call (Sell Call)",
-                "Strike": strike["strike"],
+                "Strategy": "Bear Call Spread",
+                "Sell Strike": sell["strike"],
+                "Buy Strike": buy["strike"],
                 "Expiry": expiry,
-                "Credit": round(credit, 2),
-                "Prob (~)": "65-75%",
-                "Risk": "Defined"
+                "Credit ($)": round(credit * 100, 2),
+                "Max Risk ($)": round(risk, 2),
+                "Market": condition
             }
 
         else:
-            # Iron Condor (simplified)
             return {
                 "Ticker": ticker,
-                "Strategy": "Iron Condor",
-                "Strike": "Wide",
+                "Strategy": "Iron Condor (manual)",
+                "Sell Strikes": "OTM both sides",
                 "Expiry": expiry,
-                "Credit": "Est",
-                "Prob (~)": "60-70%",
-                "Risk": "Defined"
+                "Credit ($)": "Est",
+                "Max Risk ($)": "<=500",
+                "Market": condition
             }
 
     except:
@@ -106,7 +119,7 @@ def find_trade(stock, ticker, price, condition):
 if st.button("Run Scan"):
 
     if not user_input:
-        st.warning("Please enter at least one ticker")
+        st.warning("Enter at least one ticker")
     else:
         st.write("🔄 Running scan...")
 
@@ -118,22 +131,21 @@ if st.button("Run Scan"):
         for ticker in tickers:
             st.write(f"Checking {ticker}...")
 
-            stock, price = get_stock(ticker)
+            stock, hist, price = get_stock(ticker)
+
             if stock is None:
                 continue
 
-            hist = stock.history(period="1mo")
             condition = classify_market(hist)
 
-            trade = find_trade(stock, ticker, price, condition)
+            trade = build_spread(stock, ticker, price, condition)
 
             if trade:
-                trade["Market"] = condition
                 results.append(trade)
 
         if results:
             df = pd.DataFrame(results)
-            st.subheader("🏆 Trade Ideas")
+            st.subheader("🏆 Trade Ideas (Risk Controlled)")
             st.dataframe(df, use_container_width=True)
         else:
-            st.error("No trades found.")
+            st.error("No valid spreads found under risk limit.")
