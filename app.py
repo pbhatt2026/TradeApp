@@ -1,18 +1,19 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import math
 
-st.set_page_config(page_title="Options Scanner")
+st.set_page_config(page_title="Options Trading System")
 
-st.title("📊 Options Trading Scanner (Spreads + Risk Control)")
+st.title("📊 Options Trading System (Disciplined Mode)")
 
 user_input = st.text_input("Enter up to 10 tickers (comma separated):")
 
 system_tickers = ["SPY", "QQQ", "IWM", "AAPL", "MSFT"]
 
-MAX_RISK = 500  # your rule
+MAX_RISK = 500
 
-# ---------------- STOCK ----------------
+# ---------------- DATA ----------------
 def get_stock(ticker):
     try:
         stock = yf.Ticker(ticker)
@@ -37,8 +38,37 @@ def classify_market(hist):
     else:
         return "Bearish"
 
-# ---------------- SPREAD BUILDER ----------------
-def build_spread(stock, ticker, price, condition):
+# ---------------- VOLATILITY FILTER ----------------
+def volatility_ok(hist):
+    returns = hist["Close"].pct_change().abs()
+    avg_move = returns.mean()
+    return avg_move > 0.01  # ~1% daily move
+
+# ---------------- PROBABILITY ----------------
+def estimate_probability(price, strike):
+    distance = abs(price - strike) / price
+
+    if distance > 0.05:
+        return 75
+    elif distance > 0.03:
+        return 70
+    elif distance > 0.02:
+        return 68
+    else:
+        return 60
+
+# ---------------- EARNINGS ----------------
+def check_earnings(stock):
+    try:
+        cal = stock.calendar
+        if cal is not None and not cal.empty:
+            return True
+        return False
+    except:
+        return False
+
+# ---------------- SPREAD ----------------
+def build_trade(stock, ticker, price, hist, condition):
 
     try:
         expiry = stock.options[0]
@@ -47,70 +77,67 @@ def build_spread(stock, ticker, price, condition):
         calls = chain.calls.sort_values("strike")
         puts = chain.puts.sort_values("strike")
 
-        width = 5  # default spread width
-
         if condition == "Bullish":
-            otm_puts = puts[puts["strike"] < price]
-
-            if len(otm_puts) < 2:
+            otm = puts[puts["strike"] < price]
+            if len(otm) < 2:
                 return None
 
-            sell = otm_puts.iloc[-1]
-            buy = otm_puts.iloc[-2]
+            sell = otm.iloc[-1]
+            buy = otm.iloc[-2]
 
-            credit = sell["lastPrice"] - buy["lastPrice"]
-            risk = (sell["strike"] - buy["strike"]) * 100 - credit * 100
-
-            if risk > MAX_RISK or credit <= 0:
-                return None
-
-            return {
-                "Ticker": ticker,
-                "Strategy": "Bull Put Spread",
-                "Sell Strike": sell["strike"],
-                "Buy Strike": buy["strike"],
-                "Expiry": expiry,
-                "Credit ($)": round(credit * 100, 2),
-                "Max Risk ($)": round(risk, 2),
-                "Market": condition
-            }
-
-        elif condition == "Bearish":
-            otm_calls = calls[calls["strike"] > price]
-
-            if len(otm_calls) < 2:
-                return None
-
-            sell = otm_calls.iloc[0]
-            buy = otm_calls.iloc[1]
-
-            credit = sell["lastPrice"] - buy["lastPrice"]
-            risk = (buy["strike"] - sell["strike"]) * 100 - credit * 100
-
-            if risk > MAX_RISK or credit <= 0:
-                return None
-
-            return {
-                "Ticker": ticker,
-                "Strategy": "Bear Call Spread",
-                "Sell Strike": sell["strike"],
-                "Buy Strike": buy["strike"],
-                "Expiry": expiry,
-                "Credit ($)": round(credit * 100, 2),
-                "Max Risk ($)": round(risk, 2),
-                "Market": condition
-            }
+            strategy = "Bull Put Spread"
+            entry_note = "Enter on pullback near support"
 
         else:
-            return {
-                "Ticker": ticker,
-                "Strategy": "Iron Condor (manual)",
-                "Sell Strikes": "OTM both sides",
-                "Expiry": expiry,
-                "Credit ($)": "Est",
-                "Max Risk ($)": "<=500",
-                "Market": condition
-            }
+            otm = calls[calls["strike"] > price]
+            if len(otm) < 2:
+                return None
+
+            sell = otm.iloc[0]
+            buy = otm.iloc[1]
+
+            strategy = "Bear Call Spread"
+            entry_note = "Enter on rally near resistance"
+
+        credit = sell["lastPrice"] - buy["lastPrice"]
+        risk = abs(sell["strike"] - buy["strike"]) * 100 - credit * 100
+
+        if credit <= 0 or risk > MAX_RISK:
+            return None
+
+        prob = estimate_probability(price, sell["strike"])
+
+        # -------- STRICT FILTERS --------
+        if prob < 68:
+            return None
+
+        if credit * 100 < 120:
+            return None
+
+        if not volatility_ok(hist):
+            return None
+
+        if check_earnings(stock):
+            return None
+
+        contracts = math.floor(MAX_RISK / risk)
+        if contracts < 1:
+            return None
+
+        return {
+            "Ticker": ticker,
+            "Strategy": strategy,
+            "Sell": sell["strike"],
+            "Buy": buy["strike"],
+            "Credit ($)": round(credit * 100, 2),
+            "Risk ($)": round(risk, 2),
+            "Contracts": contracts,
+            "Prob (%)": prob,
+            "Entry": entry_note,
+            "Take Profit": f"${round((credit*100)*0.5,2)}",
+            "Stop Loss": f"${round((credit*100)*1.5,2)}",
+            "Exit Rule": "Close 2–3 days before expiry"
+        }
 
     except:
         return None
@@ -118,34 +145,28 @@ def build_spread(stock, ticker, price, condition):
 # ---------------- MAIN ----------------
 if st.button("Run Scan"):
 
-    if not user_input:
-        st.warning("Enter at least one ticker")
+    user_tickers = [t.strip().upper() for t in user_input.split(",") if t.strip()][:10]
+    tickers = list(set(user_tickers + system_tickers))[:6]
+
+    results = []
+
+    for ticker in tickers:
+        stock, hist, price = get_stock(ticker)
+
+        if stock is None:
+            continue
+
+        condition = classify_market(hist)
+
+        trade = build_trade(stock, ticker, price, hist, condition)
+
+        if trade:
+            results.append(trade)
+
+    if results:
+        df = pd.DataFrame(results)
+
+        st.subheader("🏆 Top Trades (Max 3)")
+        st.dataframe(df.head(3), use_container_width=True)
     else:
-        st.write("🔄 Running scan...")
-
-        user_tickers = [t.strip().upper() for t in user_input.split(",") if t.strip()][:10]
-        tickers = list(set(user_tickers + system_tickers))[:6]
-
-        results = []
-
-        for ticker in tickers:
-            st.write(f"Checking {ticker}...")
-
-            stock, hist, price = get_stock(ticker)
-
-            if stock is None:
-                continue
-
-            condition = classify_market(hist)
-
-            trade = build_spread(stock, ticker, price, condition)
-
-            if trade:
-                results.append(trade)
-
-        if results:
-            df = pd.DataFrame(results)
-            st.subheader("🏆 Trade Ideas (Risk Controlled)")
-            st.dataframe(df, use_container_width=True)
-        else:
-            st.error("No valid spreads found under risk limit.")
+        st.warning("No trades meet strict criteria today.")
