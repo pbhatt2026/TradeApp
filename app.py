@@ -26,10 +26,15 @@ def get_data(ticker):
             progress=False,
             threads=False
         )
+
         if data is None or data.empty:
+            st.write(f"⚠️ No data for {ticker}")
             return None
+
         return data
-    except:
+
+    except Exception as e:
+        st.write(f"❌ Error for {ticker}: {e}")
         return None
 
 
