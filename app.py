@@ -5,16 +5,22 @@ import math
 
 st.set_page_config(page_title="Options Trading System")
 
-st.title("📊 Options Trading System (Optimized + Delta + Scalable)")
+st.title("📊 Options Trading System (Adaptive + Real Trading Mode)")
 
 # ---------------- INPUT ----------------
 user_input = st.text_input("Enter up to 10 tickers (comma separated):")
 
-max_tickers = st.slider("Max tickers to scan", min_value=4, max_value=15, value=8)
+max_tickers = st.slider("Max tickers to scan", 4, 15, 8)
+
+# -------- TRADING CONTROLS --------
+st.subheader("⚙️ Strategy Controls")
+
+min_prob = st.slider("Min Probability (%)", 50, 80, 65)
+min_credit = st.slider("Min Credit ($)", 50, 200, 100)
+min_vol = st.slider("Min Volatility (daily move %)", 0.5, 2.0, 0.8) / 100
+max_risk = st.slider("Max Risk per Trade ($)", 100, 1000, 500)
 
 system_tickers = ["SPY", "QQQ", "IWM", "AAPL", "MSFT"]
-
-MAX_RISK = 500
 
 # ---------------- DATA ----------------
 def get_stock(ticker):
@@ -22,7 +28,7 @@ def get_stock(ticker):
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1mo")
 
-        if hist is None or hist.empty:
+        if hist.empty:
             return None, None, None
 
         price = float(hist["Close"].iloc[-1])
@@ -32,30 +38,21 @@ def get_stock(ticker):
 
 # ---------------- MARKET ----------------
 def classify_market(hist):
-    try:
-        close = hist["Close"]
-        ma20 = close.rolling(20).mean().iloc[-1]
-        price = close.iloc[-1]
+    close = hist["Close"]
+    ma20 = close.rolling(20).mean().iloc[-1]
+    price = close.iloc[-1]
 
-        if pd.isna(ma20):
-            return "Neutral"
-
-        if abs(price - ma20) / ma20 < 0.02:
-            return "Rangebound"
-        elif price > ma20:
-            return "Bullish"
-        else:
-            return "Bearish"
-    except:
-        return "Unknown"
+    if abs(price - ma20) / ma20 < 0.02:
+        return "Rangebound"
+    elif price > ma20:
+        return "Bullish"
+    else:
+        return "Bearish"
 
 # ---------------- VOLATILITY ----------------
-def volatility_ok(hist):
-    try:
-        returns = hist["Close"].pct_change().abs()
-        return returns.mean() > 0.01
-    except:
-        return False
+def get_volatility(hist):
+    returns = hist["Close"].pct_change().abs()
+    return returns.mean()
 
 # ---------------- PROBABILITY ----------------
 def estimate_probability(delta):
@@ -71,7 +68,7 @@ def check_earnings(stock):
     except:
         return False
 
-# ---------------- SPREAD OPTIMIZER ----------------
+# ---------------- OPTIMIZER ----------------
 def find_best_spread(options):
 
     candidates = []
@@ -84,7 +81,7 @@ def find_best_spread(options):
         width = abs(sell["strike"] - buy["strike"])
         risk = width * 100 - credit * 100
 
-        if credit <= 0 or risk <= 0 or risk > MAX_RISK:
+        if credit <= 0 or risk <= 0 or risk > max_risk:
             continue
 
         delta = sell.get("delta", None)
@@ -119,20 +116,19 @@ def build_trade(stock, ticker, price, hist, condition):
         calls = chain.calls.sort_values("strike")
         puts = chain.puts.sort_values("strike")
 
-        reasons = []
-        status = "✅ Valid"
+        vol = get_volatility(hist)
 
         if condition == "Bullish":
             options = puts[puts["strike"] < price]
             best = find_best_spread(options)
             strategy = "Bull Put Spread"
-            entry = "Wait for pullback near support"
+            entry = "Wait for pullback"
 
         elif condition == "Bearish":
             options = calls[calls["strike"] > price]
             best = find_best_spread(options)
             strategy = "Bear Call Spread"
-            entry = "Wait for rally near resistance"
+            entry = "Wait for rally"
 
         else:
             return None
@@ -149,44 +145,50 @@ def build_trade(stock, ticker, price, hist, condition):
         ror = best["ror"]
         delta = best["delta"]
 
-        # -------- FILTERS --------
-        if prob < 68:
+        reasons = []
+        status = "✅ Valid"
+
+        # -------- ADAPTIVE FILTERS --------
+        if prob < min_prob:
             reasons.append("Low Probability")
-            status = "❌ Reject"
+            status = "⚠️ Caution"
 
-        if credit * 100 < 120:
+        if credit * 100 < min_credit:
             reasons.append("Low Credit")
-            status = "❌ Reject"
+            status = "⚠️ Caution"
 
-        if not volatility_ok(hist):
+        if vol < min_vol:
             reasons.append("Low Volatility")
-            status = "❌ Reject"
+            status = "⚠️ Caution"
 
         if check_earnings(stock):
             reasons.append("Earnings Risk")
-            if status != "❌ Reject":
-                status = "⚠️ Caution"
+            status = "⚠️ Caution"
 
-        contracts = max(1, int(MAX_RISK // risk)) if risk > 0 else 0
+        # Hard reject only for bad risk
+        if risk > max_risk:
+            status = "❌ Reject"
+            reasons.append("Too Risky")
+
+        contracts = max(1, int(max_risk // risk)) if risk > 0 else 0
 
         return {
             "Ticker": ticker,
             "Strategy": strategy,
             "Sell": sell["strike"],
             "Buy": buy["strike"],
-            "Expiry": expiry,
             "Credit ($)": round(credit * 100, 2),
             "Risk ($)": round(risk, 2),
             "ROR (%)": round(ror * 100, 1),
             "Contracts": contracts,
             "Prob (%)": prob,
+            "Volatility (%)": round(vol * 100, 2),
             "Delta": round(delta, 2) if delta else "N/A",
             "Status": status,
             "Reasons": ", ".join(reasons) if reasons else "Meets criteria",
             "Entry": entry,
             "Take Profit": f"${round((credit*100)*0.5,2)}",
             "Stop Loss": f"${round((credit*100)*1.5,2)}",
-            "Exit Rule": "Close 2–3 days before expiry",
             "Market": condition
         }
 
@@ -196,52 +198,40 @@ def build_trade(stock, ticker, price, hist, condition):
 # ---------------- MAIN ----------------
 if st.button("Run Scan"):
 
-    if not user_input:
-        st.warning("Enter at least one ticker")
+    user_tickers = [t.strip().upper() for t in user_input.split(",") if t.strip()][:10]
+    tickers = list(set(user_tickers + system_tickers))[:max_tickers]
+
+    results = []
+
+    for ticker in tickers:
+        stock, hist, price = get_stock(ticker)
+        if stock is None:
+            continue
+
+        condition = classify_market(hist)
+        trade = build_trade(stock, ticker, price, hist, condition)
+
+        if trade:
+            results.append(trade)
+
+    if results:
+        df = pd.DataFrame(results)
+
+        def rank(s):
+            return 0 if s == "✅ Valid" else 1 if s == "⚠️ Caution" else 2
+
+        df["Rank"] = df["Status"].apply(rank)
+        df = df.sort_values(by=["Rank", "Prob (%)"], ascending=[True, False])
+
+        st.subheader("📊 Trade Candidates (Adaptive System)")
+        st.dataframe(df.drop(columns=["Rank"]), use_container_width=True)
+
+        # Summary
+        st.write(
+            f"✅ Valid: {len(df[df['Status']=='✅ Valid'])} | "
+            f"⚠️ Caution: {len(df[df['Status']=='⚠️ Caution'])} | "
+            f"❌ Reject: {len(df[df['Status']=='❌ Reject'])}"
+        )
+
     else:
-        st.write("🔄 Running scan...")
-
-        user_tickers = [t.strip().upper() for t in user_input.split(",") if t.strip()][:10]
-
-        tickers = list(set(user_tickers + system_tickers))[:max_tickers]
-
-        results = []
-
-        for ticker in tickers:
-            st.write(f"Checking {ticker}...")
-
-            stock, hist, price = get_stock(ticker)
-
-            if stock is None:
-                continue
-
-            condition = classify_market(hist)
-
-            trade = build_trade(stock, ticker, price, hist, condition)
-
-            if trade:
-                results.append(trade)
-
-        # ---------------- OUTPUT ----------------
-        if results:
-            df = pd.DataFrame(results)
-
-            def rank(s):
-                return 0 if s == "✅ Valid" else 1 if s == "⚠️ Caution" else 2
-
-            df["Rank"] = df["Status"].apply(rank)
-
-            df = df.sort_values(by=["Rank", "Prob (%)"], ascending=[True, False])
-
-            st.subheader("📊 All Trade Candidates (Sorted)")
-            st.dataframe(df.drop(columns=["Rank"]), use_container_width=True)
-
-            # -------- SUMMARY --------
-            valid_count = len(df[df["Status"] == "✅ Valid"])
-            caution_count = len(df[df["Status"] == "⚠️ Caution"])
-            reject_count = len(df[df["Status"] == "❌ Reject"])
-
-            st.write(f"✅ Valid: {valid_count} | ⚠️ Caution: {caution_count} | ❌ Rejected: {reject_count}")
-
-        else:
-            st.warning("No trades generated.")
+        st.warning("No trades generated.")
