@@ -2,41 +2,61 @@ import streamlit as st
 import yfinance as yf
 import pandas as pd
 import math
+from datetime import datetime
 
 st.set_page_config(page_title="Options Trading System")
 
-st.title("📊 Options Trading System (Adaptive + Real Trading Mode)")
+st.title("📊 Options Trading System (Execution Ready)")
 
 # ---------------- INPUT ----------------
 user_input = st.text_input("Enter up to 10 tickers (comma separated):")
 
 max_tickers = st.slider("Max tickers to scan", 4, 15, 8)
 
-# -------- TRADING CONTROLS --------
 st.subheader("⚙️ Strategy Controls")
 
 min_prob = st.slider("Min Probability (%)", 50, 80, 65)
 min_credit = st.slider("Min Credit ($)", 50, 200, 100)
-min_vol = st.slider("Min Volatility (daily move %)", 0.5, 2.0, 0.8) / 100
+min_vol = st.slider("Min Volatility (%)", 0.5, 2.0, 0.8) / 100
 max_risk = st.slider("Max Risk per Trade ($)", 100, 1000, 500)
+
+expiry_mode = st.selectbox(
+    "Expiry",
+    ["Weekly (0-7 DTE)", "Balanced (7-14 DTE)", "Monthly (14-30 DTE)"]
+)
 
 system_tickers = ["SPY", "QQQ", "IWM", "AAPL", "MSFT"]
 
-# ---------------- DATA ----------------
+# ---------------- HELPERS ----------------
 def get_stock(ticker):
     try:
         stock = yf.Ticker(ticker)
         hist = stock.history(period="1mo")
-
         if hist.empty:
             return None, None, None
-
         price = float(hist["Close"].iloc[-1])
         return stock, hist, price
     except:
         return None, None, None
 
-# ---------------- MARKET ----------------
+def select_expiry(stock):
+    expiries = stock.options
+    today = datetime.today()
+
+    target = 10 if "Balanced" in expiry_mode else 5 if "Weekly" in expiry_mode else 21
+
+    best = None
+    diff_min = 999
+
+    for exp in expiries:
+        dte = (datetime.strptime(exp, "%Y-%m-%d") - today).days
+        diff = abs(dte - target)
+        if diff < diff_min:
+            diff_min = diff
+            best = exp
+
+    return best
+
 def classify_market(hist):
     close = hist["Close"]
     ma20 = close.rolling(20).mean().iloc[-1]
@@ -49,24 +69,33 @@ def classify_market(hist):
     else:
         return "Bearish"
 
-# ---------------- VOLATILITY ----------------
 def get_volatility(hist):
-    returns = hist["Close"].pct_change().abs()
-    return returns.mean()
+    return hist["Close"].pct_change().abs().mean()
 
-# ---------------- PROBABILITY ----------------
 def estimate_probability(delta):
-    if delta is None:
-        return 65
-    return round((1 - abs(delta)) * 100, 1)
+    return 65 if delta is None else round((1 - abs(delta)) * 100, 1)
 
-# ---------------- EARNINGS ----------------
-def check_earnings(stock):
+# ---------------- LIQUIDITY ----------------
+def liquidity_ok(option):
     try:
-        cal = stock.calendar
-        return cal is not None and not cal.empty
+        bid = option.get("bid", 0)
+        ask = option.get("ask", 0)
+        volume = option.get("volume", 0)
+        oi = option.get("openInterest", 0)
+
+        if bid == 0 or ask == 0:
+            return False
+
+        spread = (ask - bid) / ((ask + bid) / 2)
+
+        return spread < 0.15 and (volume > 50 or oi > 500)
     except:
         return False
+
+def mid_price(option):
+    bid = option.get("bid", 0)
+    ask = option.get("ask", 0)
+    return (bid + ask) / 2 if bid and ask else option.get("lastPrice", 0)
 
 # ---------------- OPTIMIZER ----------------
 def find_best_spread(options):
@@ -77,7 +106,10 @@ def find_best_spread(options):
         sell = options.iloc[i]
         buy = options.iloc[i + 2]
 
-        credit = sell["lastPrice"] - buy["lastPrice"]
+        if not liquidity_ok(sell) or not liquidity_ok(buy):
+            continue
+
+        credit = mid_price(sell) - mid_price(buy)
         width = abs(sell["strike"] - buy["strike"])
         risk = width * 100 - credit * 100
 
@@ -88,7 +120,7 @@ def find_best_spread(options):
         prob = estimate_probability(delta)
         ror = (credit * 100) / risk
 
-        score = prob * 0.6 + ror * 100 * 0.4
+        score = prob * 0.5 + ror * 100 * 0.3 + 20  # liquidity bonus baked in
 
         candidates.append({
             "sell": sell,
@@ -110,9 +142,11 @@ def find_best_spread(options):
 def build_trade(stock, ticker, price, hist, condition):
 
     try:
-        expiry = stock.options[0]
-        chain = stock.option_chain(expiry)
+        expiry = select_expiry(stock)
+        if not expiry:
+            return None
 
+        chain = stock.option_chain(expiry)
         calls = chain.calls.sort_values("strike")
         puts = chain.puts.sort_values("strike")
 
@@ -122,74 +156,48 @@ def build_trade(stock, ticker, price, hist, condition):
             options = puts[puts["strike"] < price]
             best = find_best_spread(options)
             strategy = "Bull Put Spread"
-            entry = "Wait for pullback"
 
         elif condition == "Bearish":
             options = calls[calls["strike"] > price]
             best = find_best_spread(options)
             strategy = "Bear Call Spread"
-            entry = "Wait for rally"
 
         else:
             return None
 
-        if best is None:
+        if not best:
             return None
-
-        sell = best["sell"]
-        buy = best["buy"]
 
         credit = best["credit"]
         risk = best["risk"]
         prob = best["prob"]
         ror = best["ror"]
-        delta = best["delta"]
 
-        reasons = []
-        status = "✅ Valid"
+        # -------- FINAL DECISION --------
+        if prob >= min_prob and credit * 100 >= min_credit and vol >= min_vol:
+            decision = "🟢 TRADE"
+        elif prob >= min_prob - 5:
+            decision = "🟡 WATCH"
+        else:
+            decision = "🔴 SKIP"
 
-        # -------- ADAPTIVE FILTERS --------
-        if prob < min_prob:
-            reasons.append("Low Probability")
-            status = "⚠️ Caution"
-
-        if credit * 100 < min_credit:
-            reasons.append("Low Credit")
-            status = "⚠️ Caution"
-
-        if vol < min_vol:
-            reasons.append("Low Volatility")
-            status = "⚠️ Caution"
-
-        if check_earnings(stock):
-            reasons.append("Earnings Risk")
-            status = "⚠️ Caution"
-
-        # Hard reject only for bad risk
-        if risk > max_risk:
-            status = "❌ Reject"
-            reasons.append("Too Risky")
-
-        contracts = max(1, int(max_risk // risk)) if risk > 0 else 0
+        contracts = max(1, int(max_risk // risk))
 
         return {
             "Ticker": ticker,
+            "Expiry": expiry,
             "Strategy": strategy,
-            "Sell": sell["strike"],
-            "Buy": buy["strike"],
+            "Sell": best["sell"]["strike"],
+            "Buy": best["buy"]["strike"],
             "Credit ($)": round(credit * 100, 2),
             "Risk ($)": round(risk, 2),
             "ROR (%)": round(ror * 100, 1),
             "Contracts": contracts,
             "Prob (%)": prob,
-            "Volatility (%)": round(vol * 100, 2),
-            "Delta": round(delta, 2) if delta else "N/A",
-            "Status": status,
-            "Reasons": ", ".join(reasons) if reasons else "Meets criteria",
-            "Entry": entry,
+            "Decision": decision,
+            "Entry": "Wait for pullback/rally",
             "Take Profit": f"${round((credit*100)*0.5,2)}",
-            "Stop Loss": f"${round((credit*100)*1.5,2)}",
-            "Market": condition
+            "Stop Loss": f"${round((credit*100)*1.5,2)}"
         }
 
     except:
@@ -198,14 +206,14 @@ def build_trade(stock, ticker, price, hist, condition):
 # ---------------- MAIN ----------------
 if st.button("Run Scan"):
 
-    user_tickers = [t.strip().upper() for t in user_input.split(",") if t.strip()][:10]
+    user_tickers = [t.strip().upper() for t in user_input.split(",") if t.strip()]
     tickers = list(set(user_tickers + system_tickers))[:max_tickers]
 
     results = []
 
     for ticker in tickers:
         stock, hist, price = get_stock(ticker)
-        if stock is None:
+        if not stock:
             continue
 
         condition = classify_market(hist)
@@ -216,22 +224,10 @@ if st.button("Run Scan"):
 
     if results:
         df = pd.DataFrame(results)
+        st.dataframe(df, use_container_width=True)
 
-        def rank(s):
-            return 0 if s == "✅ Valid" else 1 if s == "⚠️ Caution" else 2
-
-        df["Rank"] = df["Status"].apply(rank)
-        df = df.sort_values(by=["Rank", "Prob (%)"], ascending=[True, False])
-
-        st.subheader("📊 Trade Candidates (Adaptive System)")
-        st.dataframe(df.drop(columns=["Rank"]), use_container_width=True)
-
-        # Summary
-        st.write(
-            f"✅ Valid: {len(df[df['Status']=='✅ Valid'])} | "
-            f"⚠️ Caution: {len(df[df['Status']=='⚠️ Caution'])} | "
-            f"❌ Reject: {len(df[df['Status']=='❌ Reject'])}"
-        )
+        st.subheader("🔥 Only Trade These")
+        st.dataframe(df[df["Decision"] == "🟢 TRADE"], use_container_width=True)
 
     else:
-        st.warning("No trades generated.")
+        st.warning("No execution-quality trades found.")
