@@ -5,7 +5,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="Options Trading System")
 
-st.title("📊 Options Trading System (Execution + Full Visibility)")
+st.title("📊 Options Trading System (Execution + Entry Timing)")
 
 # ---------------- INPUT ----------------
 user_input = st.text_input("Enter tickers (comma separated):")
@@ -16,10 +16,7 @@ min_credit = st.slider("Min Credit ($)", 50, 200, 100)
 min_vol = st.slider("Min Volatility (%)", 0.5, 2.0, 0.8) / 100
 max_risk = st.slider("Max Risk ($)", 100, 1000, 500)
 
-expiry_mode = st.selectbox(
-    "Expiry",
-    ["Weekly", "Balanced", "Monthly"]
-)
+expiry_mode = st.selectbox("Expiry", ["Weekly", "Balanced", "Monthly"])
 
 system_tickers = ["SPY", "QQQ", "IWM", "AAPL", "MSFT"]
 
@@ -35,24 +32,21 @@ def get_stock(t):
         return None, None, None
 
 def select_expiry(stock):
-    try:
-        expiries = stock.options
-        today = datetime.today()
+    expiries = stock.options
+    today = datetime.today()
 
-        target = 10 if expiry_mode=="Balanced" else 5 if expiry_mode=="Weekly" else 21
+    target = 10 if expiry_mode=="Balanced" else 5 if expiry_mode=="Weekly" else 21
 
-        best, best_diff = None, 999
+    best, best_diff = None, 999
 
-        for exp in expiries:
-            dte = (datetime.strptime(exp,"%Y-%m-%d") - today).days
-            diff = abs(dte-target)
-            if diff < best_diff:
-                best_diff = diff
-                best = exp
+    for exp in expiries:
+        dte = (datetime.strptime(exp,"%Y-%m-%d") - today).days
+        diff = abs(dte-target)
+        if diff < best_diff:
+            best_diff = diff
+            best = exp
 
-        return best
-    except:
-        return None
+    return best
 
 def prob(delta):
     return 65 if delta is None else round((1-abs(delta))*100,1)
@@ -61,19 +55,21 @@ def vol(hist):
     return hist["Close"].pct_change().abs().mean()
 
 def liquidity(opt):
-    try:
-        bid, ask = opt.get("bid",0), opt.get("ask",0)
-        if bid==0 or ask==0:
-            return True   # fallback allow
-
-        spread = (ask-bid)/((ask+bid)/2)
-        return spread < 0.25
-    except:
+    bid, ask = opt.get("bid",0), opt.get("ask",0)
+    if bid==0 or ask==0:
         return True
+    spread = (ask-bid)/((ask+bid)/2)
+    return spread < 0.25
 
 def mid(opt):
     bid, ask = opt.get("bid",0), opt.get("ask",0)
     return (bid+ask)/2 if bid and ask else opt.get("lastPrice",0)
+
+# ---------------- ENTRY LOGIC ----------------
+def entry_zone(hist):
+    recent_high = hist["High"].tail(5).max()
+    recent_low = hist["Low"].tail(5).min()
+    return recent_low, recent_high
 
 # ---------------- BUILD ----------------
 def build_trade(stock, ticker, price, hist):
@@ -86,9 +82,23 @@ def build_trade(stock, ticker, price, hist):
     calls = chain.calls.sort_values("strike")
     puts = chain.puts.sort_values("strike")
 
-    market = "Bullish" if price > hist["Close"].rolling(20).mean().iloc[-1] else "Bearish"
+    ma20 = hist["Close"].rolling(20).mean().iloc[-1]
+    market = "Bullish" if price > ma20 else "Bearish"
 
-    options = puts[puts["strike"] < price] if market=="Bullish" else calls[calls["strike"] > price]
+    low, high = entry_zone(hist)
+
+    if market=="Bullish":
+        options = puts[puts["strike"] < price]
+        strategy = "Bull Put Spread"
+        option_type = "PUT"
+        direction = "Bullish"
+        entry_text = f"Enter on dip near ${round(low,2)}"
+    else:
+        options = calls[calls["strike"] > price]
+        strategy = "Bear Call Spread"
+        option_type = "CALL"
+        direction = "Bearish"
+        entry_text = f"Enter on rally near ${round(high,2)}"
 
     best = None
 
@@ -109,7 +119,10 @@ def build_trade(stock, ticker, price, hist):
         p = prob(delta)
         ror = (credit*100)/risk
 
-        score = p*0.6 + ror*100*0.4
+        # -------- DISTANCE --------
+        strike_dist = abs(sell["strike"] - price) / price * 100
+
+        score = p*0.5 + ror*100*0.3 + strike_dist*0.2
 
         if not best or score > best["score"]:
             best = {
@@ -119,6 +132,7 @@ def build_trade(stock, ticker, price, hist):
                 "risk": risk,
                 "prob": p,
                 "ror": ror,
+                "dist": strike_dist,
                 "score": score
             }
 
@@ -141,8 +155,13 @@ def build_trade(stock, ticker, price, hist):
     return {
         "Ticker": ticker,
         "Expiry": expiry,
+        "Strategy": strategy,
+        "Type": option_type,
+        "Direction": direction,
         "Sell": best["sell"]["strike"],
         "Buy": best["buy"]["strike"],
+        "Strike Distance (%)": round(best["dist"],2),
+        "Entry Zone": entry_text,
         "Credit": round(best["credit"]*100,2),
         "Risk": round(best["risk"],2),
         "Prob": best["prob"],
@@ -171,10 +190,10 @@ if st.button("Run Scan"):
     if results:
         df = pd.DataFrame(results)
 
-        st.subheader("📊 All Evaluated Trades")
+        st.subheader("📊 All Trades (with Entry Timing)")
         st.dataframe(df, use_container_width=True)
 
-        st.subheader("🟢 Executable Trades")
+        st.subheader("🟢 Best Trades to Execute")
         st.dataframe(df[df["Decision"]=="🟢 TRADE"], use_container_width=True)
 
     else:
