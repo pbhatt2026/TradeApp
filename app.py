@@ -5,7 +5,7 @@ from datetime import datetime
 
 st.set_page_config(page_title="Options Trading System PRO")
 
-st.title("📊 Options Trading System (Pro Execution Engine)")
+st.title("📊 Options Trading System (Execution + Ranking Engine)")
 
 # ---------------- INPUT ----------------
 user_input = st.text_input("Enter tickers (comma separated):")
@@ -21,7 +21,7 @@ expiry_mode = st.selectbox("Expiry", ["Weekly", "Balanced", "Monthly"])
 
 system_tickers = ["SPY", "QQQ", "IWM", "AAPL", "MSFT"]
 
-# ---------------- DATA ----------------
+# ---------------- HELPERS ----------------
 def get_stock(t):
     try:
         s = yf.Ticker(t)
@@ -32,25 +32,20 @@ def get_stock(t):
     except:
         return None, None, None
 
-# ---------------- EXPIRY ----------------
 def select_expiry(stock):
-    try:
-        expiries = stock.options
-        today = datetime.today()
-        target = 10 if expiry_mode=="Balanced" else 5 if expiry_mode=="Weekly" else 21
+    expiries = stock.options
+    today = datetime.today()
+    target = 10 if expiry_mode=="Balanced" else 5 if expiry_mode=="Weekly" else 21
 
-        best, best_diff = None, 999
-        for exp in expiries:
-            dte = (datetime.strptime(exp,"%Y-%m-%d") - today).days
-            diff = abs(dte-target)
-            if diff < best_diff:
-                best_diff = diff
-                best = exp
-        return best
-    except:
-        return None
+    best, best_diff = None, 999
+    for exp in expiries:
+        dte = (datetime.strptime(exp,"%Y-%m-%d") - today).days
+        diff = abs(dte-target)
+        if diff < best_diff:
+            best_diff = diff
+            best = exp
+    return best
 
-# ---------------- METRICS ----------------
 def prob(delta):
     return 65 if delta is None else round((1-abs(delta))*100,1)
 
@@ -65,7 +60,7 @@ def mid(opt):
 def entry_zone(hist):
     return hist["Low"].tail(5).min(), hist["High"].tail(5).max()
 
-# ---------------- GREEKS ENGINE ----------------
+# ---------------- GREEKS ----------------
 def estimate_delta(strike, price):
     return min(0.5, 0.1 + abs(strike-price)/price)
 
@@ -84,6 +79,43 @@ def get_greeks(opt, price, dte):
     vega = opt.get("vega") or estimate_vega(dte)
     gamma = opt.get("gamma") or estimate_gamma(opt["strike"], price)
     return delta, theta, vega, gamma
+
+# ---------------- COLOR LABEL ----------------
+def color_label(val, col):
+    try:
+        val = float(val)
+    except:
+        return str(val)
+
+    if col == "Theta":
+        icon = "🟢" if val > 0.02 else "🟡" if val > 0 else "🔴"
+    elif col == "Vega":
+        icon = "🟢" if abs(val) < 0.05 else "🟡" if abs(val) < 0.15 else "🔴"
+    elif col == "Gamma":
+        icon = "🟢" if val < 0.03 else "🟡" if val < 0.08 else "🔴"
+    else:
+        return val
+
+    return f"{icon} {round(val,4)}"
+
+# ---------------- SCORING ----------------
+def trade_score(prob, ror, theta, dist, vega):
+    score = (
+        prob * 0.35 +
+        ror * 100 * 0.2 +
+        theta * 100 * 0.2 +
+        dist * 0.15 -
+        abs(vega) * 100 * 0.1
+    )
+    return round(max(0, min(score, 100)), 1)
+
+def signal_label(score):
+    if score >= 75:
+        return "🟢 STRONG"
+    elif score >= 60:
+        return "🟡 MODERATE"
+    else:
+        return "🔴 WEAK"
 
 # ---------------- BUILD ----------------
 def build_trade(stock, ticker, price, hist):
@@ -138,13 +170,7 @@ def build_trade(stock, ticker, price, hist):
         ror = (credit*100)/risk
         dist = abs(sell["strike"] - price)/price*100
 
-        score = (
-            p*0.35 +
-            ror*100*0.2 +
-            net_theta*100*0.2 +
-            dist*0.15 -
-            abs(net_vega)*0.1
-        )
+        score = trade_score(p, ror, net_theta, dist, net_vega)
 
         if not best or score > best["score"]:
             best = {
@@ -164,7 +190,6 @@ def build_trade(stock, ticker, price, hist):
     if not best:
         return None
 
-    # -------- DECISION --------
     reasons = []
 
     if best["prob"] < min_prob:
@@ -173,10 +198,6 @@ def build_trade(stock, ticker, price, hist):
         reasons.append("Low Credit")
     if vol(hist) < min_vol:
         reasons.append("Low Vol")
-    if best["gamma"] > 0.08:
-        reasons.append("High Gamma")
-    if best["theta"] < 0:
-        reasons.append("Low Theta")
 
     decision = "🟢 TRADE" if len(reasons)==0 else "🟡 WATCH" if len(reasons)<=2 else "🔴 SKIP"
 
@@ -193,30 +214,14 @@ def build_trade(stock, ticker, price, hist):
         "Risk": round(best["risk"],2),
         "Prob": best["prob"],
         "ROR": round(best["ror"]*100,1),
-        "Theta": round(best["theta"],4),
-        "Vega": round(best["vega"],4),
-        "Gamma": round(best["gamma"],4),
+        "Theta": best["theta"],
+        "Vega": best["vega"],
+        "Gamma": best["gamma"],
+        "Score": best["score"],
+        "Signal": signal_label(best["score"]),
         "Decision": decision,
         "Reasons": ", ".join(reasons) if reasons else "Strong Setup"
     }
-
-# ---------------- COLORING ----------------
-def highlight(val, col):
-    try:
-        val = float(val)
-    except:
-        return ""
-
-    if col=="Theta":
-        color = "green" if val>0.02 else "orange" if val>0 else "red"
-    elif col=="Vega":
-        color = "green" if abs(val)<0.05 else "orange" if abs(val)<0.15 else "red"
-    elif col=="Gamma":
-        color = "green" if val<0.03 else "orange" if val<0.08 else "red"
-    else:
-        return ""
-
-    return f"color:{color}; font-weight:bold"
 
 # ---------------- MAIN ----------------
 if st.button("Run Scan"):
@@ -238,17 +243,19 @@ if st.button("Run Scan"):
     if results:
         df = pd.DataFrame(results)
 
-        st.subheader("📊 All Trades (Execution View)")
+        # color Greeks
+        df["Theta"] = df["Theta"].apply(lambda v: color_label(v,"Theta"))
+        df["Vega"] = df["Vega"].apply(lambda v: color_label(v,"Vega"))
+        df["Gamma"] = df["Gamma"].apply(lambda v: color_label(v,"Gamma"))
 
-        styled = df.style \
-            .applymap(lambda v: highlight(v,"Theta"), subset=["Theta"]) \
-            .applymap(lambda v: highlight(v,"Vega"), subset=["Vega"]) \
-            .applymap(lambda v: highlight(v,"Gamma"), subset=["Gamma"])
+        # ranking
+        df = df.sort_values(by="Score", ascending=False)
 
-        st.dataframe(styled, use_container_width=True)
+        st.subheader("📊 All Trades Ranked")
+        st.dataframe(df, use_container_width=True)
 
-        st.subheader("🟢 Best Trades")
-        st.dataframe(df[df["Decision"]=="🟢 TRADE"], use_container_width=True)
+        st.subheader("🏆 Top 3 Trades")
+        st.dataframe(df.head(3), use_container_width=True)
 
     else:
         st.warning("No trades evaluated.")
