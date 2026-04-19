@@ -3,9 +3,9 @@ import yfinance as yf
 import pandas as pd
 from datetime import datetime
 
-st.set_page_config(page_title="Options Trading System")
+st.set_page_config(page_title="Options Trading System PRO")
 
-st.title("📊 Options Trading System (Execution + Entry Timing)")
+st.title("📊 Options Trading System (Pro Greeks Engine)")
 
 # ---------------- INPUT ----------------
 user_input = st.text_input("Enter tickers (comma separated):")
@@ -34,18 +34,15 @@ def get_stock(t):
 def select_expiry(stock):
     expiries = stock.options
     today = datetime.today()
-
     target = 10 if expiry_mode=="Balanced" else 5 if expiry_mode=="Weekly" else 21
 
     best, best_diff = None, 999
-
     for exp in expiries:
         dte = (datetime.strptime(exp,"%Y-%m-%d") - today).days
         diff = abs(dte-target)
         if diff < best_diff:
             best_diff = diff
             best = exp
-
     return best
 
 def prob(delta):
@@ -54,22 +51,42 @@ def prob(delta):
 def vol(hist):
     return hist["Close"].pct_change().abs().mean()
 
-def liquidity(opt):
-    bid, ask = opt.get("bid",0), opt.get("ask",0)
-    if bid==0 or ask==0:
-        return True
-    spread = (ask-bid)/((ask+bid)/2)
-    return spread < 0.25
-
 def mid(opt):
     bid, ask = opt.get("bid",0), opt.get("ask",0)
     return (bid+ask)/2 if bid and ask else opt.get("lastPrice",0)
 
-# ---------------- ENTRY LOGIC ----------------
-def entry_zone(hist):
-    recent_high = hist["High"].tail(5).max()
-    recent_low = hist["Low"].tail(5).min()
-    return recent_low, recent_high
+# ---------------- GREEKS ENGINE ----------------
+def estimate_delta(strike, price):
+    moneyness = abs(strike - price) / price
+    return min(0.5, 0.1 + moneyness)
+
+def estimate_theta(dte):
+    return -1 / max(dte,1)
+
+def estimate_vega(dte):
+    return 0.1 * (dte / 30)
+
+def estimate_gamma(strike, price):
+    dist = abs(strike - price) / price
+    return max(0.01, 0.1 - dist)
+
+def get_greeks(opt, price, dte):
+    delta = opt.get("delta")
+    theta = opt.get("theta")
+    vega = opt.get("vega")
+    gamma = opt.get("gamma")
+
+    # fallback logic
+    if delta is None:
+        delta = estimate_delta(opt["strike"], price)
+    if theta is None:
+        theta = estimate_theta(dte)
+    if vega is None:
+        vega = estimate_vega(dte)
+    if gamma is None:
+        gamma = estimate_gamma(opt["strike"], price)
+
+    return delta, theta, vega, gamma
 
 # ---------------- BUILD ----------------
 def build_trade(stock, ticker, price, hist):
@@ -78,6 +95,9 @@ def build_trade(stock, ticker, price, hist):
     if not expiry:
         return None
 
+    exp_date = datetime.strptime(expiry,"%Y-%m-%d")
+    dte = (exp_date - datetime.today()).days
+
     chain = stock.option_chain(expiry)
     calls = chain.calls.sort_values("strike")
     puts = chain.puts.sort_values("strike")
@@ -85,28 +105,19 @@ def build_trade(stock, ticker, price, hist):
     ma20 = hist["Close"].rolling(20).mean().iloc[-1]
     market = "Bullish" if price > ma20 else "Bearish"
 
-    low, high = entry_zone(hist)
-
     if market=="Bullish":
         options = puts[puts["strike"] < price]
         strategy = "Bull Put Spread"
-        option_type = "PUT"
-        direction = "Bullish"
-        entry_text = f"Enter on dip near ${round(low,2)}"
+        opt_type = "PUT"
     else:
         options = calls[calls["strike"] > price]
         strategy = "Bear Call Spread"
-        option_type = "CALL"
-        direction = "Bearish"
-        entry_text = f"Enter on rally near ${round(high,2)}"
+        opt_type = "CALL"
 
     best = None
 
     for i in range(len(options)-3):
         sell, buy = options.iloc[i], options.iloc[i+2]
-
-        if not liquidity(sell) or not liquidity(buy):
-            continue
 
         credit = mid(sell) - mid(buy)
         width = abs(sell["strike"] - buy["strike"])
@@ -115,14 +126,25 @@ def build_trade(stock, ticker, price, hist):
         if credit<=0 or risk<=0:
             continue
 
-        delta = sell.get("delta",None)
-        p = prob(delta)
+        # -------- Greeks --------
+        sd, st, sv, sg = get_greeks(sell, price, dte)
+        bd, bt, bv, bg = get_greeks(buy, price, dte)
+
+        net_theta = st - bt
+        net_vega = sv - bv
+        gamma = sg
+
+        p = prob(sd)
         ror = (credit*100)/risk
+        dist = abs(sell["strike"] - price)/price*100
 
-        # -------- DISTANCE --------
-        strike_dist = abs(sell["strike"] - price) / price * 100
-
-        score = p*0.5 + ror*100*0.3 + strike_dist*0.2
+        score = (
+            p*0.35 +
+            ror*100*0.2 +
+            net_theta*100*0.2 +
+            dist*0.15 -
+            abs(net_vega)*0.1
+        )
 
         if not best or score > best["score"]:
             best = {
@@ -132,7 +154,10 @@ def build_trade(stock, ticker, price, hist):
                 "risk": risk,
                 "prob": p,
                 "ror": ror,
-                "dist": strike_dist,
+                "dist": dist,
+                "theta": net_theta,
+                "vega": net_vega,
+                "gamma": gamma,
                 "score": score
             }
 
@@ -143,12 +168,14 @@ def build_trade(stock, ticker, price, hist):
 
     if best["prob"] < min_prob:
         reasons.append("Low Prob")
-
     if best["credit"]*100 < min_credit:
         reasons.append("Low Credit")
-
     if vol(hist) < min_vol:
         reasons.append("Low Vol")
+    if best["gamma"] > 0.08:
+        reasons.append("High Gamma Risk")
+    if best["theta"] < 0:
+        reasons.append("Low Theta")
 
     decision = "🟢 TRADE" if len(reasons)==0 else "🟡 WATCH" if len(reasons)<=2 else "🔴 SKIP"
 
@@ -156,18 +183,19 @@ def build_trade(stock, ticker, price, hist):
         "Ticker": ticker,
         "Expiry": expiry,
         "Strategy": strategy,
-        "Type": option_type,
-        "Direction": direction,
+        "Type": opt_type,
         "Sell": best["sell"]["strike"],
         "Buy": best["buy"]["strike"],
-        "Strike Distance (%)": round(best["dist"],2),
-        "Entry Zone": entry_text,
         "Credit": round(best["credit"]*100,2),
         "Risk": round(best["risk"],2),
         "Prob": best["prob"],
         "ROR": round(best["ror"]*100,1),
+        "Theta": round(best["theta"],4),
+        "Vega": round(best["vega"],4),
+        "Gamma": round(best["gamma"],4),
+        "Strike Dist %": round(best["dist"],2),
         "Decision": decision,
-        "Reasons": ", ".join(reasons) if reasons else "Good Trade"
+        "Reasons": ", ".join(reasons) if reasons else "Strong Setup"
     }
 
 # ---------------- MAIN ----------------
@@ -190,10 +218,10 @@ if st.button("Run Scan"):
     if results:
         df = pd.DataFrame(results)
 
-        st.subheader("📊 All Trades (with Entry Timing)")
+        st.subheader("📊 Trades with Greeks Intelligence")
         st.dataframe(df, use_container_width=True)
 
-        st.subheader("🟢 Best Trades to Execute")
+        st.subheader("🟢 Best Trades")
         st.dataframe(df[df["Decision"]=="🟢 TRADE"], use_container_width=True)
 
     else:
