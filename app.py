@@ -1,28 +1,31 @@
 import streamlit as st
 import yfinance as yf
 import pandas as pd
+import requests
+import time
 from datetime import datetime
 
 st.set_page_config(page_title="Options Trading System PRO")
 
-st.title("📊 Options Trading System (Execution + Ranking Engine)")
+st.title("📊 Options Trading System (Stable Data Engine)")
 
 # ---------------- INPUT ----------------
-user_input = st.text_input("Enter tickers (comma separated):")
-max_tickers = st.slider("Max tickers", 4, 15, 8)
+user_input = st.text_input("Enter 2–4 tickers (comma separated):")
 
-st.subheader("⚙️ Strategy Controls")
+max_tickers = 4
+
+st.subheader("⚙️ Controls")
 min_prob = st.slider("Min Probability (%)", 50, 80, 65)
 min_credit = st.slider("Min Credit ($)", 50, 200, 100)
-min_vol = st.slider("Min Volatility (%)", 0.5, 2.0, 0.8) / 100
-max_risk = st.slider("Max Risk ($)", 100, 1000, 500)
 
 expiry_mode = st.selectbox("Expiry", ["Weekly", "Balanced", "Monthly"])
 
-system_tickers = ["SPY", "QQQ", "IWM", "AAPL", "MSFT"]
+# ---------------- TD CONFIG ----------------
+TD_API_KEY = "YOUR_TD_API_KEY_HERE"  # <-- replace
 
-# ---------------- HELPERS ----------------
-def get_stock(t):
+# ---------------- DATA FETCH ----------------
+@st.cache_data(ttl=300)
+def get_stock_yf(t):
     try:
         s = yf.Ticker(t)
         h = s.history(period="1mo")
@@ -32,135 +35,91 @@ def get_stock(t):
     except:
         return None, None, None
 
-def select_expiry(stock):
-    expiries = stock.options
-    today = datetime.today()
-    target = 10 if expiry_mode=="Balanced" else 5 if expiry_mode=="Weekly" else 21
+def get_stock_td(t):
+    try:
+        url = f"https://api.tdameritrade.com/v1/marketdata/{t}/quotes"
+        params = {"apikey": TD_API_KEY}
+        r = requests.get(url, params=params)
+        data = r.json()
 
-    best, best_diff = None, 999
-    for exp in expiries:
-        dte = (datetime.strptime(exp,"%Y-%m-%d") - today).days
-        diff = abs(dte-target)
-        if diff < best_diff:
-            best_diff = diff
-            best = exp
-    return best
+        price = data[t]["lastPrice"]
+        return price
+    except:
+        return None
 
-def prob(delta):
-    return 65 if delta is None else round((1-abs(delta))*100,1)
+def get_stock(t):
+    # -------- TRY YAHOO --------
+    s, h, p = get_stock_yf(t)
 
-def vol(hist):
-    return hist["Close"].pct_change().abs().mean()
+    if s and p:
+        return s, h, p, "YF"
 
-# ---------------- REALISTIC PRICING ----------------
+    # -------- FALLBACK TD --------
+    p_td = get_stock_td(t)
+
+    if p_td:
+        return None, None, p_td, "TD"
+
+    return None, None, None, "FAIL"
+
+# ---------------- EXPIRY ----------------
+@st.cache_data(ttl=300)
+def get_expiry(stock):
+    try:
+        expiries = stock.options
+        today = datetime.today()
+        target = 10 if expiry_mode=="Balanced" else 5 if expiry_mode=="Weekly" else 21
+
+        best, best_diff = None, 999
+        for exp in expiries:
+            dte = (datetime.strptime(exp,"%Y-%m-%d") - today).days
+            diff = abs(dte-target)
+            if diff < best_diff:
+                best_diff = diff
+                best = exp
+        return best
+    except:
+        return None
+
+@st.cache_data(ttl=300)
+def get_chain(stock, expiry):
+    try:
+        return stock.option_chain(expiry)
+    except:
+        return None
+
+# ---------------- PRICING ----------------
 def safe_price(opt, side):
     bid = opt.get("bid", 0)
     ask = opt.get("ask", 0)
     last = opt.get("lastPrice", 0)
 
     if bid > 0 and ask > 0:
-        return bid if side == "sell" else ask
+        return bid if side=="sell" else ask
 
     return last if last > 0 else 0
-
-# ---------------- ENTRY ----------------
-def entry_zone(hist):
-    return hist["Low"].tail(5).min(), hist["High"].tail(5).max()
-
-# ---------------- GREEKS ----------------
-def estimate_delta(strike, price):
-    return min(0.5, 0.1 + abs(strike-price)/price)
-
-def estimate_theta(dte):
-    return -1/max(dte,1)
-
-def estimate_vega(dte):
-    return 0.1*(dte/30)
-
-def estimate_gamma(strike, price):
-    return max(0.01, 0.1 - abs(strike-price)/price)
-
-def get_greeks(opt, price, dte):
-    delta = opt.get("delta") or estimate_delta(opt["strike"], price)
-    theta = opt.get("theta") or estimate_theta(dte)
-    vega = opt.get("vega") or estimate_vega(dte)
-    gamma = opt.get("gamma") or estimate_gamma(opt["strike"], price)
-    return delta, theta, vega, gamma
-
-# ---------------- COLOR LABELS ----------------
-def color_label(val, col):
-    try:
-        val = float(val)
-    except:
-        return str(val)
-
-    if col == "Theta":
-        icon = "🟢" if val > 0.02 else "🟡" if val > 0 else "🔴"
-    elif col == "Vega":
-        icon = "🟢" if abs(val) < 0.05 else "🟡" if abs(val) < 0.15 else "🔴"
-    elif col == "Gamma":
-        icon = "🟢" if val < 0.03 else "🟡" if val < 0.08 else "🔴"
-    else:
-        return val
-
-    return f"{icon} {round(val,4)}"
-
-def cushion_label(val):
-    if val > 4:
-        return f"🟢 {round(val,2)}%"
-    elif val > 2:
-        return f"🟡 {round(val,2)}%"
-    else:
-        return f"🔴 {round(val,2)}%"
-
-# ---------------- SCORING ----------------
-def trade_score(prob, ror, theta, dist, vega):
-    score = (
-        prob * 0.35 +
-        ror * 100 * 0.2 +
-        theta * 100 * 0.2 +
-        dist * 0.15 -
-        abs(vega) * 100 * 0.1
-    )
-    return round(max(0, min(score, 100)), 1)
-
-def signal_label(score):
-    if score >= 75:
-        return "🟢 STRONG"
-    elif score >= 60:
-        return "🟡 MODERATE"
-    else:
-        return "🔴 WEAK"
 
 # ---------------- BUILD ----------------
 def build_trade(stock, ticker, price, hist):
 
-    expiry = select_expiry(stock)
+    if stock is None:
+        return None  # TD fallback cannot fetch options yet
+
+    expiry = get_expiry(stock)
     if not expiry:
         return None
 
-    exp_date = datetime.strptime(expiry,"%Y-%m-%d")
-    dte = (exp_date - datetime.today()).days
+    chain = get_chain(stock, expiry)
+    if chain is None:
+        return None
 
-    chain = stock.option_chain(expiry)
     calls = chain.calls.sort_values("strike")
     puts = chain.puts.sort_values("strike")
 
     ma20 = hist["Close"].rolling(20).mean().iloc[-1]
-    market = "Bullish" if price > ma20 else "Bearish"
+    bullish = price > ma20
 
-    low, high = entry_zone(hist)
-
-    if market=="Bullish":
-        options = puts[puts["strike"] < price]
-        strategy = "Bull Put Spread"
-        opt_type = "PUT"
-        entry_text = f"Enter near ${round(low,2)}"
-    else:
-        options = calls[calls["strike"] > price]
-        strategy = "Bear Call Spread"
-        opt_type = "CALL"
-        entry_text = f"Enter near ${round(high,2)}"
+    options = puts[puts["strike"] < price] if bullish else calls[calls["strike"] > price]
 
     best = None
 
@@ -174,34 +133,22 @@ def build_trade(stock, ticker, price, hist):
         width = abs(sell["strike"] - buy["strike"])
         risk = width*100 - credit*100
 
-        if credit<=0 or risk<=0:
+        if credit <= 0 or risk <= 0:
             continue
 
-        sd, stheta, svega, sgamma = get_greeks(sell, price, dte)
-        bd, btheta, bvega, bgamma = get_greeks(buy, price, dte)
-
-        net_theta = stheta - btheta
-        net_vega = svega - bvega
-        gamma = sgamma
-
-        p = prob(sd)
+        prob = 70
         ror = (credit*100)/risk
         dist = abs(sell["strike"] - price)/price*100
 
-        score = trade_score(p, ror, net_theta, dist, net_vega)
+        score = prob*0.4 + ror*100*0.3 + dist*0.3
 
         if not best or score > best["score"]:
             best = {
-                "sell": sell,
-                "buy": buy,
+                "sell": sell["strike"],
+                "buy": buy["strike"],
                 "credit": credit,
                 "risk": risk,
-                "prob": p,
-                "ror": ror,
                 "dist": dist,
-                "theta": net_theta,
-                "vega": net_vega,
-                "gamma": gamma,
                 "score": score
             }
 
@@ -210,57 +157,41 @@ def build_trade(stock, ticker, price, hist):
 
     return {
         "Ticker": ticker,
-        "Expiry": expiry,
-        "Strategy": strategy,
-        "Type": opt_type,
-        "Sell": best["sell"]["strike"],
-        "Buy": best["buy"]["strike"],
-        "Entry Zone": entry_text,
-        "Safety Cushion": best["dist"],
+        "Sell": best["sell"],
+        "Buy": best["buy"],
         "Credit": round(best["credit"]*100,2),
         "Risk": round(best["risk"],2),
-        "Prob": best["prob"],
-        "ROR": round(best["ror"]*100,1),
-        "Theta": best["theta"],
-        "Vega": best["vega"],
-        "Gamma": best["gamma"],
-        "Score": best["score"],
-        "Signal": signal_label(best["score"])
+        "Safety Cushion": f"{round(best['dist'],2)}%",
+        "Score": round(best["score"],1)
     }
 
 # ---------------- MAIN ----------------
 if st.button("Run Scan"):
 
-    user = [t.strip().upper() for t in user_input.split(",") if t.strip()]
-    tickers = list(set(user + system_tickers))[:max_tickers]
+    tickers = [t.strip().upper() for t in user_input.split(",") if t.strip()][:max_tickers]
 
     results = []
 
     for t in tickers:
-        s,h,p = get_stock(t)
-        if not s:
+        stock, hist, price, source = get_stock(t)
+
+        if price is None:
+            st.warning(f"{t}: No data available")
             continue
 
-        trade = build_trade(s,t,p,h)
+        trade = build_trade(stock, t, price, hist)
+
         if trade:
+            trade["Source"] = source
             results.append(trade)
 
+        time.sleep(0.3)
+
     if results:
-        df = pd.DataFrame(results)
+        df = pd.DataFrame(results).sort_values(by="Score", ascending=False)
 
-        # color formatting
-        df["Theta"] = df["Theta"].apply(lambda v: color_label(v,"Theta"))
-        df["Vega"] = df["Vega"].apply(lambda v: color_label(v,"Vega"))
-        df["Gamma"] = df["Gamma"].apply(lambda v: color_label(v,"Gamma"))
-        df["Safety Cushion"] = df["Safety Cushion"].apply(cushion_label)
-
-        df = df.sort_values(by="Score", ascending=False)
-
-        st.subheader("📊 All Trades Ranked")
+        st.subheader("📊 Trades (Stable Mode)")
         st.dataframe(df, use_container_width=True)
 
-        st.subheader("🏆 Top 3 Trades")
-        st.dataframe(df.head(3), use_container_width=True)
-
     else:
-        st.warning("No trades evaluated.")
+        st.warning("No trades found.")
