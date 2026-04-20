@@ -52,9 +52,16 @@ def prob(delta):
 def vol(hist):
     return hist["Close"].pct_change().abs().mean()
 
-def mid(opt):
-    bid, ask = opt.get("bid",0), opt.get("ask",0)
-    return (bid+ask)/2 if bid and ask else opt.get("lastPrice",0)
+# ---------------- REALISTIC PRICING ----------------
+def safe_price(opt, side):
+    bid = opt.get("bid", 0)
+    ask = opt.get("ask", 0)
+    last = opt.get("lastPrice", 0)
+
+    if bid > 0 and ask > 0:
+        return bid if side == "sell" else ask
+
+    return last if last > 0 else 0
 
 # ---------------- ENTRY ----------------
 def entry_zone(hist):
@@ -80,7 +87,7 @@ def get_greeks(opt, price, dte):
     gamma = opt.get("gamma") or estimate_gamma(opt["strike"], price)
     return delta, theta, vega, gamma
 
-# ---------------- COLOR LABEL ----------------
+# ---------------- COLOR LABELS ----------------
 def color_label(val, col):
     try:
         val = float(val)
@@ -97,6 +104,14 @@ def color_label(val, col):
         return val
 
     return f"{icon} {round(val,4)}"
+
+def cushion_label(val):
+    if val > 4:
+        return f"🟢 {round(val,2)}%"
+    elif val > 2:
+        return f"🟡 {round(val,2)}%"
+    else:
+        return f"🔴 {round(val,2)}%"
 
 # ---------------- SCORING ----------------
 def trade_score(prob, ror, theta, dist, vega):
@@ -152,7 +167,10 @@ def build_trade(stock, ticker, price, hist):
     for i in range(len(options)-3):
         sell, buy = options.iloc[i], options.iloc[i+2]
 
-        credit = mid(sell) - mid(buy)
+        sell_price = safe_price(sell, "sell")
+        buy_price = safe_price(buy, "buy")
+
+        credit = sell_price - buy_price
         width = abs(sell["strike"] - buy["strike"])
         risk = width*100 - credit*100
 
@@ -190,17 +208,6 @@ def build_trade(stock, ticker, price, hist):
     if not best:
         return None
 
-    reasons = []
-
-    if best["prob"] < min_prob:
-        reasons.append("Low Prob")
-    if best["credit"]*100 < min_credit:
-        reasons.append("Low Credit")
-    if vol(hist) < min_vol:
-        reasons.append("Low Vol")
-
-    decision = "🟢 TRADE" if len(reasons)==0 else "🟡 WATCH" if len(reasons)<=2 else "🔴 SKIP"
-
     return {
         "Ticker": ticker,
         "Expiry": expiry,
@@ -209,7 +216,7 @@ def build_trade(stock, ticker, price, hist):
         "Sell": best["sell"]["strike"],
         "Buy": best["buy"]["strike"],
         "Entry Zone": entry_text,
-        "Strike Dist %": round(best["dist"],2),
+        "Safety Cushion": best["dist"],
         "Credit": round(best["credit"]*100,2),
         "Risk": round(best["risk"],2),
         "Prob": best["prob"],
@@ -218,9 +225,7 @@ def build_trade(stock, ticker, price, hist):
         "Vega": best["vega"],
         "Gamma": best["gamma"],
         "Score": best["score"],
-        "Signal": signal_label(best["score"]),
-        "Decision": decision,
-        "Reasons": ", ".join(reasons) if reasons else "Strong Setup"
+        "Signal": signal_label(best["score"])
     }
 
 # ---------------- MAIN ----------------
@@ -243,12 +248,12 @@ if st.button("Run Scan"):
     if results:
         df = pd.DataFrame(results)
 
-        # color Greeks
+        # color formatting
         df["Theta"] = df["Theta"].apply(lambda v: color_label(v,"Theta"))
         df["Vega"] = df["Vega"].apply(lambda v: color_label(v,"Vega"))
         df["Gamma"] = df["Gamma"].apply(lambda v: color_label(v,"Gamma"))
+        df["Safety Cushion"] = df["Safety Cushion"].apply(cushion_label)
 
-        # ranking
         df = df.sort_values(by="Score", ascending=False)
 
         st.subheader("📊 All Trades Ranked")
